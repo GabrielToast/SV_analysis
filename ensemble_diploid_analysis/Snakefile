@@ -1,0 +1,358 @@
+"""
+Snakemake pipeline: SV calling with Manta, Delly, and smoove,
+excluding the mitochondrial genome and unplaced/repetitive scaffolds,
+followed by a per-sample SURVIVOR merge of the three VCFs and a
+final summary table of SV type counts across all samples.
+
+Usage:
+    snakemake -n            # dry run first
+    snakemake -j 32
+
+Expected layout (edit config.yaml to match your paths):
+    bams/<sample>.bam
+    bams/<sample>.bam.bai
+    reference/<ref>.fna
+    reference/<ref>.fna.fai
+"""
+
+import glob
+import os
+
+configfile: "config.yaml"
+
+# config["samples"] can be either:
+#   - a YAML list of sample names, e.g. samples: [P1, P2, P3]
+#   - a path (string) to a plain text file with one sample name per line
+def _load_samples(value):
+    if isinstance(value, str):
+        samples_file = os.path.expanduser(value)
+        with open(samples_file) as fh:
+            names = [
+                line.strip() for line in fh
+                if line.strip() and not line.strip().startswith("#")
+            ]
+        if len(names) == 0:
+            raise ValueError(f"No sample names found in samples file: {samples_file}")
+        return names
+    return list(value)
+
+SAMPLES = _load_samples(config["samples"])
+REF = os.path.expanduser(config["reference"])
+BAM_DIR = os.path.expanduser(config["bam_dir"])
+RESULTS = os.path.expanduser(config["results_dir"])
+
+# Full paths to each tool's binary, since Manta/Delly/smoove/SURVIVOR each
+# live in their own conda env, and Snakemake's shell commands don't
+# activate a different env per rule automatically.
+CONDA_BASE = os.path.expanduser(config.get("conda_base", "~/miniconda3"))
+TOOL_ENVS = config.get("tool_envs", {})
+
+def env_bin(tool, binary_name=None):
+    env_name = TOOL_ENVS.get(tool, tool)
+    binary_name = binary_name or tool
+    return os.path.join(CONDA_BASE, "envs", env_name, "bin", binary_name)
+
+MANTA_CONFIG = env_bin("manta", "configManta.py")
+DELLY_BIN = env_bin("delly", "delly")
+SMOOVE_BIN = env_bin("smoove", "smoove")
+SURVIVOR_BIN = env_bin("survivor", "SURVIVOR")
+
+# Plain env-name variables for use inside shell: blocks. Snakemake's shell
+# strings are filled in with Python's str.format(), which allows attribute
+# access (foo.bar) but NOT method calls with arguments (foo.get("x", "y")),
+# so `{TOOL_ENVS.get("smoove", "smoove")}` inside a shell block raises an
+# AttributeError instead of calling the method. Resolving these once here
+# avoids that.
+MANTA_ENV = TOOL_ENVS.get("manta", "manta")
+DELLY_ENV = TOOL_ENVS.get("delly", "delly")
+SMOOVE_ENV = TOOL_ENVS.get("smoove", "smoove")
+
+# Resolve each short sample name (e.g. "P27152_181") to its actual BAM file
+# in BAM_DIR (e.g. "P27152_181_S12_rg_rmd.bam"), by prefix match. This lets
+# config.yaml list short sample names without needing full/exact filenames.
+def _resolve_bam(sample):
+    matches = sorted(glob.glob(os.path.join(BAM_DIR, f"{sample}_*.bam")))
+    if len(matches) == 0:
+        print(f"WARNING: no BAM found for sample '{sample}' -- skipping it.")
+        return None
+    if len(matches) > 1:
+        print(
+            f"WARNING: multiple BAMs match sample '{sample}': {matches} "
+            f"-- skipping it (ambiguous match)."
+        )
+        return None
+    return matches[0]
+
+SAMPLE_BAM = {s: _resolve_bam(s) for s in SAMPLES}
+SAMPLE_BAM = {s: p for s, p in SAMPLE_BAM.items() if p is not None}
+SAMPLES = list(SAMPLE_BAM.keys())
+
+def bam_for(wildcards):
+    return SAMPLE_BAM[wildcards.sample]
+
+def bai_for(wildcards):
+    # Try the standard htslib naming first ("<bam>.bai"), then fall back to
+    # the alternate pattern some tools use ("<bam-without-.bam-ext>.bai").
+    bam_path = SAMPLE_BAM[wildcards.sample]
+    standard = bam_path + ".bai"
+    if os.path.exists(standard):
+        return standard
+    alt = os.path.splitext(bam_path)[0] + ".bai"
+    if os.path.exists(alt):
+        return alt
+    # Neither found -- return the standard path anyway so Snakemake's own
+    # error message tells you exactly which file it expected.
+    return standard
+
+# Regex matching the contig names to KEEP (main chromosomes only).
+# Everything else -- mitochondrial genome, unplaced/repetitive scaffolds --
+# is excluded from calling. Default keeps NC_0376xx-style RefSeq chromosome
+# accessions; override "chrom_regex" in config.yaml if your reference uses
+# different naming.
+CHROM_REGEX = config.get("chrom_regex", "^NC_0376")
+
+rule all:
+    input:
+        expand(f"{RESULTS}/merged/{{sample}}_merged.vcf", sample=SAMPLES),
+        f"{RESULTS}/summary/sv_type_summary.tsv"
+
+
+# ---------------------------------------------------------------------
+# 0. Build the region files used to exclude mito + repetitive scaffolds
+# ---------------------------------------------------------------------
+rule build_regions:
+    input:
+        fai=f"{REF}.fai"
+    output:
+        callable_bed=f"{RESULTS}/regions/callable_regions.bed.gz",
+        callable_tbi=f"{RESULTS}/regions/callable_regions.bed.gz.tbi",
+        exclude_plain=f"{RESULTS}/regions/exclude_regions.bed",
+        exclude_gz=f"{RESULTS}/regions/exclude_regions.bed.gz",
+        exclude_tbi=f"{RESULTS}/regions/exclude_regions.bed.gz.tbi"
+    params:
+        regex=CHROM_REGEX
+    shell:
+        """
+        mkdir -p {RESULTS}/regions
+
+        # Regions to CALL (main chromosomes only) -- used by Manta
+        awk -v OFS='\\t' -v re="{params.regex}" \
+            '$1 ~ re {{print $1, 0, $2}}' {input.fai} \
+            > {RESULTS}/regions/callable_regions.bed
+        sort -k1,1 -k2,2n {RESULTS}/regions/callable_regions.bed \
+            | bgzip > {output.callable_bed}
+        tabix -p bed {output.callable_bed}
+
+        # Regions to EXCLUDE (everything NOT matching the keep-regex) --
+        # used by Delly (-x, plain BED) and smoove (--exclude, bgzipped BED)
+        awk -v OFS='\\t' -v re="{params.regex}" \
+            '$1 !~ re {{print $1, 0, $2}}' {input.fai} \
+            > {output.exclude_plain}
+        sort -k1,1 -k2,2n {output.exclude_plain} | bgzip > {output.exclude_gz}
+        tabix -p bed {output.exclude_gz}
+        """
+
+
+# ---------------------------------------------------------------------
+# 1. Manta
+# ---------------------------------------------------------------------
+rule manta:
+    input:
+        bam=bam_for,
+        bai=bai_for,
+        ref=REF,
+        fai=f"{REF}.fai",
+        regions=f"{RESULTS}/regions/callable_regions.bed.gz",
+        regions_tbi=f"{RESULTS}/regions/callable_regions.bed.gz.tbi"
+    output:
+        vcf=f"{RESULTS}/manta/{{sample}}/results/variants/diploidSV.vcf.gz"
+    params:
+        rundir=f"{RESULTS}/manta/{{sample}}"
+    threads: 4
+    log:
+        f"{RESULTS}/logs/manta_{{sample}}.log"
+    shell:
+        """
+        rm -rf {params.rundir}
+        source {CONDA_BASE}/etc/profile.d/conda.sh
+        conda activate {MANTA_ENV}
+
+        {MANTA_CONFIG} --bam {input.bam} --referenceFasta {input.ref} \
+            --callRegions {input.regions} \
+            --runDir {params.rundir} > {log} 2>&1
+        {params.rundir}/runWorkflow.py -m local -j {threads} >> {log} 2>&1
+        """
+
+rule manta_to_plain_vcf:
+    input:
+        f"{RESULTS}/manta/{{sample}}/results/variants/diploidSV.vcf.gz"
+    output:
+        f"{RESULTS}/manta/{{sample}}/{{sample}}_manta.vcf"
+    shell:
+        "zcat {input} > {output}"
+
+
+# ---------------------------------------------------------------------
+# 2. Delly
+# ---------------------------------------------------------------------
+rule delly:
+    input:
+        bam=bam_for,
+        bai=bai_for,
+        ref=REF,
+        fai=f"{REF}.fai",
+        exclude=f"{RESULTS}/regions/exclude_regions.bed"
+    output:
+        bcf=f"{RESULTS}/delly/{{sample}}/{{sample}}_delly.bcf"
+    log:
+        f"{RESULTS}/logs/delly_{{sample}}.log"
+    shell:
+        """
+        mkdir -p {RESULTS}/delly/{wildcards.sample}
+        source {CONDA_BASE}/etc/profile.d/conda.sh
+        conda activate {DELLY_ENV}
+        {DELLY_BIN} sr -g {input.ref} -x {input.exclude} -o {output.bcf} \
+            {input.bam} > {log} 2>&1
+        """
+
+rule delly_to_plain_vcf:
+    input:
+        f"{RESULTS}/delly/{{sample}}/{{sample}}_delly.bcf"
+    output:
+        f"{RESULTS}/delly/{{sample}}/{{sample}}_delly.vcf"
+    shell:
+        "bcftools view {input} > {output}"
+
+
+# ---------------------------------------------------------------------
+# 3. smoove
+# ---------------------------------------------------------------------
+rule smoove_bam:
+    input:
+        bam=bam_for,
+        bai=bai_for
+    output:
+        bam=temp(f"{RESULTS}/smoove_bams/{{sample}}.bam"),
+        bai=temp(f"{RESULTS}/smoove_bams/{{sample}}.bam.bai")
+    params:
+        hdr=f"{RESULTS}/smoove_bams/{{sample}}.hdr.sam"
+    threads: 2
+    shell:
+        """
+        mkdir -p {RESULTS}/smoove_bams
+        source {CONDA_BASE}/etc/profile.d/conda.sh
+        conda activate {SMOOVE_ENV}
+        samtools view -H {input.bam} \
+            | sed -E '/^@RG/ s/\\tLB:[^\\t]*/\\tLB:lb1/' > {params.hdr}
+        samtools reheader {params.hdr} {input.bam} > {output.bam}
+        samtools index -@ {threads} {output.bam}
+        rm -f {params.hdr}
+        """
+        
+rule smoove:
+    input:
+        bam=f"{RESULTS}/smoove_bams/{{sample}}.bam",
+        bai=f"{RESULTS}/smoove_bams/{{sample}}.bam.bai",
+        ref=REF,
+        fai=f"{REF}.fai",
+        exclude=f"{RESULTS}/regions/exclude_regions.bed.gz",
+        exclude_tbi=f"{RESULTS}/regions/exclude_regions.bed.gz.tbi"
+    output:
+        vcf=f"{RESULTS}/smoove/{{sample}}/{{sample}}-smoove.genotyped.vcf.gz"
+    params:
+        outdir=f"{RESULTS}/smoove/{{sample}}"
+    threads: 4
+    log:
+        f"{RESULTS}/logs/smoove_{{sample}}.log"
+    shell:
+        """
+        mkdir -p {params.outdir}
+        source {CONDA_BASE}/etc/profile.d/conda.sh
+        conda activate {SMOOVE_ENV}
+        {SMOOVE_BIN} call --outdir {params.outdir} --name {wildcards.sample} \
+            --exclude {input.exclude} \
+            --fasta {input.ref} -p {threads} --genotype {input.bam} \
+            > {log} 2>&1
+        """
+
+rule smoove_to_plain_vcf:
+    input:
+        f"{RESULTS}/smoove/{{sample}}/{{sample}}-smoove.genotyped.vcf.gz"
+    output:
+        f"{RESULTS}/smoove/{{sample}}/{{sample}}_smoove.vcf"
+    shell:
+        "zcat {input} > {output}"
+
+
+# ---------------------------------------------------------------------
+# 4. Merge the three callers' VCFs per sample with SURVIVOR
+# ---------------------------------------------------------------------
+rule survivor_list:
+    input:
+        manta=f"{RESULTS}/manta/{{sample}}/{{sample}}_manta.vcf",
+        delly=f"{RESULTS}/delly/{{sample}}/{{sample}}_delly.vcf",
+        smoove=f"{RESULTS}/smoove/{{sample}}/{{sample}}_smoove.vcf"
+    output:
+        f"{RESULTS}/merged/{{sample}}_vcf_list.txt"
+    shell:
+        """
+        mkdir -p {RESULTS}/merged
+        realpath {input.manta} {input.delly} {input.smoove} > {output}
+        """
+
+rule survivor_merge:
+    input:
+        f"{RESULTS}/merged/{{sample}}_vcf_list.txt"
+    output:
+        f"{RESULTS}/merged/{{sample}}_merged.vcf"
+    params:
+        max_dist=config.get("max_dist", 1000),
+        min_callers=config.get("min_callers", 1),
+        type_match=config.get("type_match", 1),
+        strand_match=config.get("strand_match", 0),
+        dist_est=config.get("dist_est", 0),
+        min_size=config.get("min_size", 50)
+    log:
+        f"{RESULTS}/logs/survivor_{{sample}}.log"
+    shell:
+        """
+        {SURVIVOR_BIN} merge {input} {params.max_dist} {params.min_callers} \
+            {params.type_match} {params.strand_match} {params.dist_est} \
+            {params.min_size} {output} > {log} 2>&1
+        """
+
+
+# ---------------------------------------------------------------------
+# 5. Summary table: SV type counts per sample, from the merged VCFs
+# ---------------------------------------------------------------------
+rule summary_table:
+    input:
+        expand(f"{RESULTS}/merged/{{sample}}_merged.vcf", sample=SAMPLES)
+    output:
+        f"{RESULTS}/summary/sv_type_summary.tsv"
+    run:
+        import re
+        from collections import defaultdict
+
+        counts = defaultdict(lambda: defaultdict(int))
+        sv_types = set()
+
+        for vcf_path, sample in zip(input, SAMPLES):
+            with open(vcf_path) as fh:
+                for line in fh:
+                    if line.startswith("#"):
+                        continue
+                    m = re.search(r"SVTYPE=([A-Z]+)", line)
+                    if m:
+                        svtype = m.group(1)
+                        counts[sample][svtype] += 1
+                        sv_types.add(svtype)
+
+        sv_types = sorted(sv_types)
+
+        with open(output[0], "w") as out:
+            out.write("Sample\t" + "\t".join(sv_types) + "\tTotal\n")
+            for sample in SAMPLES:
+                row = [str(counts[sample].get(t, 0)) for t in sv_types]
+                total = sum(counts[sample].get(t, 0) for t in sv_types)
+                out.write(f"{sample}\t" + "\t".join(row) + f"\t{total}\n")

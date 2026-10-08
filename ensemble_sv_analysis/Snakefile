@@ -1,0 +1,614 @@
+"""
+Snakemake pipeline: SV calling with Manta, Delly, and smoove,
+excluding the mitochondrial genome and unplaced/repetitive scaffolds,
+followed by a per-sample SURVIVOR merge of the three VCFs and a
+final summary table of SV type counts across all samples.
+
+Usage:
+    snakemake -n            # dry run first
+    snakemake -j 32
+
+Expected layout (edit config.yaml to match your paths):
+    bams/<sample>.bam
+    bams/<sample>.bam.bai
+    reference/<ref>.fna
+    reference/<ref>.fna.fai
+"""
+
+import glob
+import os
+
+configfile: "config.yaml"
+
+# config["samples"] can be either:
+#   - a YAML list of sample names, e.g. samples: [P1, P2, P3]
+#   - a path (string) to a plain text file with one sample name per line
+def _load_samples(value):
+    if isinstance(value, str):
+        samples_file = os.path.expanduser(value)
+        with open(samples_file) as fh:
+            names = [
+                line.strip() for line in fh
+                if line.strip() and not line.strip().startswith("#")
+            ]
+        if len(names) == 0:
+            raise ValueError(f"No sample names found in samples file: {samples_file}")
+        return names
+    return list(value)
+
+SAMPLES = _load_samples(config["samples"])
+REF = os.path.expanduser(config["reference"])
+BAM_DIR = os.path.expanduser(config["bam_dir"])
+RESULTS = os.path.expanduser(config["results_dir"])
+
+# Optional custom manta config (--config), overlaid on top of manta's own
+# packaged defaults. Used e.g. to disable remote read retrieval for
+# insertions, which can crash on certain BAMs with:
+#   "Empty read attributed to sequence fragment..."
+# Leave unset (empty string) in config.yaml to skip passing --config at all.
+MANTA_CONFIG_INI = os.path.expanduser(config.get("manta_config_ini", ""))
+
+# Full paths to each tool's binary, since Manta/Delly/smoove/SURVIVOR each
+# live in their own conda env, and Snakemake's shell commands don't
+# activate a different env per rule automatically.
+CONDA_BASE = os.path.expanduser(config.get("conda_base", "~/miniconda3"))
+TOOL_ENVS = config.get("tool_envs", {})
+
+def env_bin(tool, binary_name=None):
+    env_name = TOOL_ENVS.get(tool, tool)
+    binary_name = binary_name or tool
+    return os.path.join(CONDA_BASE, "envs", env_name, "bin", binary_name)
+
+MANTA_CONFIG = env_bin("manta", "configManta.py")
+DELLY_BIN = env_bin("delly", "delly")
+SMOOVE_BIN = env_bin("smoove", "smoove")
+SURVIVOR_BIN = env_bin("survivor", "SURVIVOR")
+SAMPLOT_BIN = env_bin("samplot", "samplot")
+
+# Plain env-name variables for use inside shell: blocks. Snakemake's shell
+# strings are filled in with Python's str.format(), which allows attribute
+# access (foo.bar) but NOT method calls with arguments (foo.get("x", "y")),
+# so `{TOOL_ENVS.get("smoove", "smoove")}` inside a shell block raises an
+# AttributeError instead of calling the method. Resolving these once here
+# avoids that.
+MANTA_ENV = TOOL_ENVS.get("manta", "manta")
+DELLY_ENV = TOOL_ENVS.get("delly", "delly")
+SMOOVE_ENV = TOOL_ENVS.get("smoove", "smoove")
+SAMPLOT_ENV = TOOL_ENVS.get("samplot", "samplot")
+
+# Resolve each short sample name (e.g. "P27152_181") to its actual BAM file
+# in BAM_DIR (e.g. "P27152_181_S12_rg_rmd.bam"), by prefix match. This lets
+# config.yaml list short sample names without needing full/exact filenames.
+def _resolve_bam(sample):
+    matches = sorted(glob.glob(os.path.join(BAM_DIR, f"{sample}*.bam")))
+    if len(matches) == 0:
+        print(f"WARNING: no BAM found for sample '{sample}' -- skipping it.")
+        return None
+    if len(matches) > 1:
+        print(
+            f"WARNING: multiple BAMs match sample '{sample}': {matches} "
+            f"-- skipping it (ambiguous match)."
+        )
+        return None
+    return matches[0]
+
+SAMPLE_BAM = {s: _resolve_bam(s) for s in SAMPLES}
+SAMPLE_BAM = {s: p for s, p in SAMPLE_BAM.items() if p is not None}
+SAMPLES = list(SAMPLE_BAM.keys())
+
+def bam_for(wildcards):
+    return SAMPLE_BAM[wildcards.sample]
+
+def bai_for(wildcards):
+    # Try the standard htslib naming first ("<bam>.bai"), then fall back to
+    # the alternate pattern some tools use ("<bam-without-.bam-ext>.bai").
+    bam_path = SAMPLE_BAM[wildcards.sample]
+    standard = bam_path + ".bai"
+    if os.path.exists(standard):
+        return standard
+    alt = os.path.splitext(bam_path)[0] + ".bai"
+    if os.path.exists(alt):
+        return alt
+    # Neither found -- return the standard path anyway so Snakemake's own
+    # error message tells you exactly which file it expected.
+    return standard
+
+# Regex matching the contig names to KEEP (main chromosomes only).
+# Everything else -- mitochondrial genome, unplaced/repetitive scaffolds --
+# is excluded from calling. Default keeps NC_0376xx-style RefSeq chromosome
+# accessions; override "chrom_regex" in config.yaml if your reference uses
+# different naming.
+CHROM_REGEX = config.get("chrom_regex", "^NC_0376")
+
+rule all:
+    input:
+        expand(f"{RESULTS}/merged_nohet/{{sample}}_merged_nohet.vcf", sample=SAMPLES),
+        f"{RESULTS}/cohort/cohort_filtered.vcf",
+        f"{RESULTS}/summary/sv_type_summary.tsv"
+
+
+# ---------------------------------------------------------------------
+# 0. Build the region files used to exclude mito + repetitive scaffolds
+# ---------------------------------------------------------------------
+rule build_regions:
+    input:
+        fai=f"{REF}.fai"
+    output:
+        callable_bed=f"{RESULTS}/regions/callable_regions.bed.gz",
+        callable_tbi=f"{RESULTS}/regions/callable_regions.bed.gz.tbi",
+        exclude_plain=f"{RESULTS}/regions/exclude_regions.bed",
+        exclude_gz=f"{RESULTS}/regions/exclude_regions.bed.gz",
+        exclude_tbi=f"{RESULTS}/regions/exclude_regions.bed.gz.tbi"
+    params:
+        regex=CHROM_REGEX
+    shell:
+        """
+        mkdir -p {RESULTS}/regions
+
+        # Regions to CALL (main chromosomes only) -- used by Manta
+        awk -v OFS='\\t' -v re="{params.regex}" \
+            '$1 ~ re {{print $1, 0, $2}}' {input.fai} \
+            > {RESULTS}/regions/callable_regions.bed
+        sort -k1,1 -k2,2n {RESULTS}/regions/callable_regions.bed \
+            | bgzip > {output.callable_bed}
+        tabix -p bed {output.callable_bed}
+
+        # Regions to EXCLUDE (everything NOT matching the keep-regex) --
+        # used by Delly (-x, plain BED) and smoove (--exclude, bgzipped BED)
+        awk -v OFS='\\t' -v re="{params.regex}" \
+            '$1 !~ re {{print $1, 0, $2}}' {input.fai} \
+            > {output.exclude_plain}
+        sort -k1,1 -k2,2n {output.exclude_plain} | bgzip > {output.exclude_gz}
+        tabix -p bed {output.exclude_gz}
+        """
+
+
+# ---------------------------------------------------------------------
+# 1. Manta
+# ---------------------------------------------------------------------
+rule manta:
+    input:
+        bam=bam_for,
+        bai=bai_for,
+        ref=REF,
+        fai=f"{REF}.fai",
+        regions=f"{RESULTS}/regions/callable_regions.bed.gz",
+        regions_tbi=f"{RESULTS}/regions/callable_regions.bed.gz.tbi"
+    output:
+        vcf=f"{RESULTS}/manta/{{sample}}/results/variants/diploidSV.vcf.gz"
+    params:
+        rundir=f"{RESULTS}/manta/{{sample}}"
+    threads: 4
+    log:
+        f"{RESULTS}/logs/manta_{{sample}}.log"
+    shell:
+        """
+        rm -rf {params.rundir}
+        source {CONDA_BASE}/etc/profile.d/conda.sh
+        conda activate {MANTA_ENV}
+
+        set +e
+        {MANTA_CONFIG} --bam {input.bam} --referenceFasta {input.ref} \
+            --callRegions {input.regions} \
+            --runDir {params.rundir} > {log} 2>&1
+        {params.rundir}/runWorkflow.py -m local -j {threads} >> {log} 2>&1
+        status=$?
+
+        if [ $status -ne 0 ] && [ -n "{MANTA_CONFIG_INI}" ]; then
+            echo "" >> {log}
+            echo "=== First manta attempt failed (exit $status). Retrying with remote read retrieval for insertions disabled: {MANTA_CONFIG_INI} ===" >> {log}
+            rm -rf {params.rundir}
+            {MANTA_CONFIG} --bam {input.bam} --referenceFasta {input.ref} \
+                --callRegions {input.regions} --config {MANTA_CONFIG_INI} \
+                --runDir {params.rundir} >> {log} 2>&1
+            {params.rundir}/runWorkflow.py -m local -j {threads} >> {log} 2>&1
+            status=$?
+        fi
+
+        set -e
+        exit $status
+        """
+
+rule manta_to_plain_vcf:
+    input:
+        f"{RESULTS}/manta/{{sample}}/results/variants/diploidSV.vcf.gz"
+    output:
+        f"{RESULTS}/manta/{{sample}}/{{sample}}_manta.vcf"
+    shell:
+        "zcat {input} > {output}"
+
+
+# ---------------------------------------------------------------------
+# 2. Delly
+# ---------------------------------------------------------------------
+rule delly:
+    input:
+        bam=bam_for,
+        bai=bai_for,
+        ref=REF,
+        fai=f"{REF}.fai",
+        exclude=f"{RESULTS}/regions/exclude_regions.bed"
+    output:
+        bcf=f"{RESULTS}/delly/{{sample}}/{{sample}}_delly.bcf"
+    log:
+        f"{RESULTS}/logs/delly_{{sample}}.log"
+    shell:
+        """
+        mkdir -p {RESULTS}/delly/{wildcards.sample}
+        source {CONDA_BASE}/etc/profile.d/conda.sh
+        conda activate {DELLY_ENV}
+        {DELLY_BIN} sr -g {input.ref} -x {input.exclude} -o {output.bcf} \
+            {input.bam} > {log} 2>&1
+        """
+
+rule delly_to_plain_vcf:
+    input:
+        f"{RESULTS}/delly/{{sample}}/{{sample}}_delly.bcf"
+    output:
+        f"{RESULTS}/delly/{{sample}}/{{sample}}_delly.vcf"
+    shell:
+        "bcftools view {input} > {output}"
+
+
+# ---------------------------------------------------------------------
+# 3. smoove
+# ---------------------------------------------------------------------
+rule smoove:
+    input:
+        bam=bam_for,
+        bai=bai_for,
+        ref=REF,
+        fai=f"{REF}.fai",
+        exclude=f"{RESULTS}/regions/exclude_regions.bed.gz",
+        exclude_tbi=f"{RESULTS}/regions/exclude_regions.bed.gz.tbi"
+    output:
+        vcf=f"{RESULTS}/smoove/{{sample}}/{{sample}}-smoove.genotyped.vcf.gz"
+    params:
+        outdir=f"{RESULTS}/smoove/{{sample}}"
+    threads: 4
+    log:
+        f"{RESULTS}/logs/smoove_{{sample}}.log"
+    shell:
+        """
+        mkdir -p {params.outdir}
+        source {CONDA_BASE}/etc/profile.d/conda.sh
+        conda activate {SMOOVE_ENV}
+        {SMOOVE_BIN} call --outdir {params.outdir} --name {wildcards.sample} \
+            --exclude {input.exclude} \
+            --fasta {input.ref} -p {threads} --genotype {input.bam} \
+            > {log} 2>&1
+        """
+
+rule smoove_to_plain_vcf:
+    input:
+        f"{RESULTS}/smoove/{{sample}}/{{sample}}-smoove.genotyped.vcf.gz"
+    output:
+        f"{RESULTS}/smoove/{{sample}}/{{sample}}_smoove.vcf"
+    shell:
+        "zcat {input} > {output}"
+
+
+# ---------------------------------------------------------------------
+# 4. Merge the three callers' VCFs per sample with SURVIVOR
+# ---------------------------------------------------------------------
+rule survivor_list:
+    input:
+        manta=f"{RESULTS}/manta/{{sample}}/{{sample}}_manta.vcf",
+        delly=f"{RESULTS}/delly/{{sample}}/{{sample}}_delly.vcf",
+        smoove=f"{RESULTS}/smoove/{{sample}}/{{sample}}_smoove.vcf"
+    output:
+        f"{RESULTS}/merged/{{sample}}_vcf_list.txt"
+    shell:
+        """
+        mkdir -p {RESULTS}/merged
+        realpath {input.manta} {input.delly} {input.smoove} > {output}
+        """
+
+rule survivor_merge:
+    input:
+        f"{RESULTS}/merged/{{sample}}_vcf_list.txt"
+    output:
+        f"{RESULTS}/merged/{{sample}}_merged.vcf"
+    params:
+        max_dist=config.get("max_dist", 1000),
+        min_callers=config.get("min_callers", 1),
+        type_match=config.get("type_match", 1),
+        strand_match=config.get("strand_match", 0),
+        dist_est=config.get("dist_est", 0),
+        min_size=config.get("min_size", 50)
+    log:
+        f"{RESULTS}/logs/survivor_{{sample}}.log"
+    shell:
+        """
+        {SURVIVOR_BIN} merge {input} {params.max_dist} {params.min_callers} \
+            {params.type_match} {params.strand_match} {params.dist_est} \
+            {params.min_size} {output} > {log} 2>&1
+        """
+
+
+# ---------------------------------------------------------------------
+# 3b. Remove heterozygous SVs from each sample's merged VCF.
+#
+#     The merged VCF has one genotype column per caller (manta, delly,
+#     smoove). An SV is dropped when it is het (0/1 or 1/0), decided by
+#     het_filter_mode in config.yaml:
+#       any       drop if ANY caller column is het            (default)
+#       majority  drop if MORE THAN HALF of the columns are het
+#       all       drop only if EVERY column is het
+#       "off"     keep everything (file is copied through unchanged)
+#     (quote "off" in YAML -- unquoted, YAML reads it as the boolean False;
+#      that is also accepted here)
+#
+#     het_require_hom_alt: true  additionally drops SVs where no caller
+#     calls hom-alt (1/1, or 1 for haploid calls).
+#
+#     The cohort merge and the summary table use these filtered files.
+#     If a merged VCF has no usable genotypes at all, the job fails with a
+#     clear message rather than silently keeping or dropping everything.
+# ---------------------------------------------------------------------
+_het_raw = config.get("het_filter_mode", "any")
+HET_FILTER_MODE = "off" if _het_raw is False else str(_het_raw).lower()
+if HET_FILTER_MODE not in ("any", "majority", "all", "off"):
+    raise ValueError(
+        "het_filter_mode in config.yaml must be any, majority, all or \"off\" "
+        f"(got {_het_raw!r})"
+    )
+HET_REQUIRE_HOM_ALT = bool(config.get("het_require_hom_alt", False))
+
+# --- het filter helper (start) ---
+def _filter_het_vcf(in_path, out_path, mode, require_hom_alt, log_path):
+    import re
+    split_re = re.compile(r"[/|]")
+
+    def classify(gt):
+        alleles = split_re.split(gt.strip())
+        if not alleles or any(a in (".", "") for a in alleles):
+            return "missing"
+        try:
+            nums = {int(a) for a in alleles}
+        except ValueError:
+            return "other"
+        if nums == {0}:
+            return "hom_ref"
+        if nums == {1}:
+            return "hom_alt"
+        if nums == {0, 1}:
+            return "het"
+        return "other"
+
+    def is_het(classes):
+        n, n_het = len(classes), sum(1 for c in classes if c == "het")
+        if n == 0 or n_het == 0:
+            return False
+        if mode == "any":
+            return True
+        if mode == "majority":
+            return n_het * 2 > n
+        return n_het == n  # mode == "all"
+
+    header, records, n_cols = [], [], 0
+    with open(in_path) as fh:
+        for line in fh:
+            if line.startswith("#"):
+                header.append(line)
+                if line.startswith("#CHROM"):
+                    n_cols = max(0, len(line.rstrip("\n").split("\t")) - 9)
+                continue
+            f = line.rstrip("\n").split("\t")
+            classes = []
+            if len(f) >= 10 and n_cols:
+                fmt = f[8].split(":")
+                gt_idx = fmt.index("GT") if "GT" in fmt else None
+                for col in f[9:9 + n_cols]:
+                    parts = col.split(":")
+                    if gt_idx is None or gt_idx >= len(parts):
+                        classes.append("missing")
+                    else:
+                        classes.append(classify(parts[gt_idx]))
+            records.append((line, classes))
+
+    n = len(records)
+    if n and not any(c != "missing" for _, cl in records for c in cl):
+        raise ValueError(
+            f"No usable genotypes in {in_path}: every GT is missing, so het SVs "
+            "cannot be identified from the merged VCF. Set het_filter_mode to "
+            "\"off\" or filter from the per-caller VCFs instead."
+        )
+
+    kept = []
+    for line, classes in records:
+        drop = is_het(classes)
+        if require_hom_alt and "hom_alt" not in classes:
+            drop = True
+        if not drop:
+            kept.append(line)
+
+    note = (f"##sv_het_filter=mode={mode}"
+            f"{',require_hom_alt' if require_hom_alt else ''}\n")
+    with open(out_path, "w") as out:
+        for h in header:
+            if h.startswith("#CHROM"):
+                out.write(note)
+            out.write(h)
+        out.writelines(kept)
+
+    with open(log_path, "w") as lf:
+        lf.write(f"mode={mode}\nrequire_hom_alt={require_hom_alt}\n"
+                 f"input_svs={n}\nkept={len(kept)}\ndropped={n - len(kept)}\n")
+# --- het filter helper (end) ---
+
+rule remove_het:
+    input:
+        f"{RESULTS}/merged/{{sample}}_merged.vcf"
+    output:
+        f"{RESULTS}/merged_nohet/{{sample}}_merged_nohet.vcf"
+    params:
+        mode=HET_FILTER_MODE,
+        require_hom_alt=HET_REQUIRE_HOM_ALT
+    log:
+        f"{RESULTS}/logs/remove_het_{{sample}}.log"
+    run:
+        if params.mode == "off":
+            shell("cp {input[0]} {output[0]} && echo 'mode=off (no filtering)' > {log}")
+        else:
+            _filter_het_vcf(input[0], output[0], params.mode,
+                            params.require_hom_alt, log[0])
+
+
+# ---------------------------------------------------------------------
+# 4a. Cohort merge: combine every sample's merged VCF into one VCF, then
+#     drop SVs seen in more than `max_samples_per_sv` samples.
+#
+#     SURVIVOR merge treats each input VCF as one "sample", so running it
+#     with min_callers=1 (union) gives one row per distinct SV, and the
+#     SUPP INFO tag = number of samples carrying it. SUPP_VEC shows which.
+#     The filter step then keeps only SVs with SUPP <= max_samples_per_sv.
+#
+#     config.yaml key (optional, default 2):
+#       max_samples_per_sv: 2
+# ---------------------------------------------------------------------
+MAX_SAMPLES_PER_SV = int(config.get("max_samples_per_sv", 2))
+
+rule cohort_list:
+    input:
+        expand(f"{RESULTS}/merged_nohet/{{sample}}_merged_nohet.vcf", sample=SAMPLES)
+    output:
+        f"{RESULTS}/cohort/cohort_vcf_list.txt"
+    shell:
+        """
+        mkdir -p {RESULTS}/cohort
+        realpath {input} > {output}
+        """
+
+rule cohort_merge:
+    input:
+        f"{RESULTS}/cohort/cohort_vcf_list.txt"
+    output:
+        f"{RESULTS}/cohort/cohort_merged.vcf"
+    params:
+        max_dist=config.get("max_dist", 1000),
+        type_match=config.get("type_match", 1),
+        strand_match=config.get("strand_match", 0),
+        dist_est=config.get("dist_est", 0),
+        min_size=config.get("min_size", 50)
+    log:
+        f"{RESULTS}/logs/cohort_merge.log"
+    shell:
+        """
+        {SURVIVOR_BIN} merge {input} {params.max_dist} 1 \
+            {params.type_match} {params.strand_match} {params.dist_est} \
+            {params.min_size} {output} > {log} 2>&1
+        """
+
+rule cohort_filter:
+    input:
+        f"{RESULTS}/cohort/cohort_merged.vcf"
+    output:
+        f"{RESULTS}/cohort/cohort_filtered.vcf"
+    params:
+        max_samples=MAX_SAMPLES_PER_SV
+    log:
+        f"{RESULTS}/logs/cohort_filter.log"
+    run:
+        import re
+        supp_re = re.compile(r"(?:^|;)SUPP=(\d+)")
+        kept = dropped = no_supp = 0
+        with open(input[0]) as fin, open(output[0], "w") as fout:
+            for line in fin:
+                if line.startswith("#"):
+                    fout.write(line)
+                    continue
+                info = line.split("\t")[7]
+                m = supp_re.search(info)
+                if m is None:
+                    # No SUPP tag: can't judge recurrence, so keep it and count it
+                    no_supp += 1
+                    fout.write(line)
+                elif int(m.group(1)) <= params.max_samples:
+                    kept += 1
+                    fout.write(line)
+                else:
+                    dropped += 1
+        with open(log[0], "w") as lf:
+            lf.write(
+                f"max_samples_per_sv={params.max_samples}\n"
+                f"kept={kept}\ndropped={dropped}\nno_SUPP_tag_kept={no_supp}\n"
+            )
+
+
+# ---------------------------------------------------------------------
+# 4b. Optional: samplot's batch "vcf" mode -- plots every SV in a sample's
+#     merged VCF and builds a single browsable index.html gallery linking
+#     to all of them, rather than one disconnected PNG per SV.
+#     Not wired into `rule all` -- run on demand, e.g.:
+#       snakemake -j 4 results/plots/P28507_494/index.html
+#
+#     NOTE: the merged VCF's sample/FORMAT columns are SURVIVOR's per-
+#     caller pseudo-samples (manta/delly/smoove), not your actual
+#     biological sample -- so genotype-based filtering in `samplot vcf`
+#     would misbehave here. --plot_all bypasses that and plots every SV
+#     regardless of genotype.
+# ---------------------------------------------------------------------
+rule samplot_gallery:
+    input:
+        vcf=f"{RESULTS}/merged/{{sample}}_merged.vcf",
+        bam=bam_for,
+        bai=bai_for
+    output:
+        html=f"{RESULTS}/plots/{{sample}}/index.html"
+    params:
+        outdir=f"{RESULTS}/plots/{{sample}}"
+    threads: 4
+    log:
+        f"{RESULTS}/logs/samplot_{{sample}}.log"
+    shell:
+        """
+        mkdir -p {params.outdir}
+        source {CONDA_BASE}/etc/profile.d/conda.sh
+        conda activate {SAMPLOT_ENV}
+        {SAMPLOT_BIN} vcf \
+            --vcf {input.vcf} \
+            -d {params.outdir} \
+            -b {input.bam} \
+            --sample_ids {wildcards.sample} \
+            --plot_all \
+            -O png \
+            -t {threads} \
+            > {log} 2>&1
+        """
+
+
+# ---------------------------------------------------------------------
+# 5. Summary table: SV type counts per sample, from the merged VCFs
+# ---------------------------------------------------------------------
+rule summary_table:
+    input:
+        expand(f"{RESULTS}/merged_nohet/{{sample}}_merged_nohet.vcf", sample=SAMPLES)
+    output:
+        f"{RESULTS}/summary/sv_type_summary.tsv"
+    run:
+        import re
+        from collections import defaultdict
+
+        counts = defaultdict(lambda: defaultdict(int))
+        sv_types = set()
+
+        for vcf_path, sample in zip(input, SAMPLES):
+            with open(vcf_path) as fh:
+                for line in fh:
+                    if line.startswith("#"):
+                        continue
+                    m = re.search(r"SVTYPE=([A-Z]+)", line)
+                    if m:
+                        svtype = m.group(1)
+                        counts[sample][svtype] += 1
+                        sv_types.add(svtype)
+
+        sv_types = sorted(sv_types)
+
+        with open(output[0], "w") as out:
+            out.write("Sample\t" + "\t".join(sv_types) + "\tTotal\n")
+            for sample in SAMPLES:
+                row = [str(counts[sample].get(t, 0)) for t in sv_types]
+                total = sum(counts[sample].get(t, 0) for t in sv_types)
+                out.write(f"{sample}\t" + "\t".join(row) + f"\t{total}\n")
