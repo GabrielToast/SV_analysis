@@ -227,32 +227,10 @@ rule delly_to_plain_vcf:
 # ---------------------------------------------------------------------
 # 3. smoove
 # ---------------------------------------------------------------------
-rule smoove_bam:
-    input:
-        bam=bam_for,
-        bai=bai_for
-    output:
-        bam=temp(f"{RESULTS}/smoove_bams/{{sample}}.bam"),
-        bai=temp(f"{RESULTS}/smoove_bams/{{sample}}.bam.bai")
-    params:
-        hdr=f"{RESULTS}/smoove_bams/{{sample}}.hdr.sam"
-    threads: 2
-    shell:
-        """
-        mkdir -p {RESULTS}/smoove_bams
-        source {CONDA_BASE}/etc/profile.d/conda.sh
-        conda activate {SMOOVE_ENV}
-        samtools view -H {input.bam} \
-            | sed -E '/^@RG/ s/\\tLB:[^\\t]*/\\tLB:lb1/' > {params.hdr}
-        samtools reheader {params.hdr} {input.bam} > {output.bam}
-        samtools index -@ {threads} {output.bam}
-        rm -f {params.hdr}
-        """
-        
 rule smoove:
     input:
-        bam=f"{RESULTS}/smoove_bams/{{sample}}.bam",
-        bai=f"{RESULTS}/smoove_bams/{{sample}}.bam.bai",
+        bam=bam_for,
+        bai=bai_for,
         ref=REF,
         fai=f"{REF}.fai",
         exclude=f"{RESULTS}/regions/exclude_regions.bed.gz",
@@ -269,10 +247,16 @@ rule smoove:
         mkdir -p {params.outdir}
         source {CONDA_BASE}/etc/profile.d/conda.sh
         conda activate {SMOOVE_ENV}
+        tmpbam={params.outdir}/{wildcards.sample}.fixed.bam
+        samtools view -H {input.bam} \
+            | sed -E '/^@RG/ s/\\tLB:[^\\t]*/\\tLB:lb1/' > {params.outdir}/hdr.sam
+        samtools reheader {params.outdir}/hdr.sam {input.bam} > $tmpbam
+        samtools index -@ {threads} $tmpbam
         {SMOOVE_BIN} call --outdir {params.outdir} --name {wildcards.sample} \
             --exclude {input.exclude} \
-            --fasta {input.ref} -p {threads} --genotype {input.bam} \
+            --fasta {input.ref} -p {threads} --genotype $tmpbam \
             > {log} 2>&1
+        rm -f $tmpbam $tmpbam.bai {params.outdir}/hdr.sam
         """
 
 rule smoove_to_plain_vcf:

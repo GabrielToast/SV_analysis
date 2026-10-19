@@ -1,6 +1,6 @@
 # My scripts
 
-Auto-organized collection of scripts (layout: `project`). Generated 2026-10-08.
+Auto-organized collection of scripts (layout: `project`).
 
 | Project | Language | File |
 |---|---|---|
@@ -10,10 +10,23 @@ Auto-organized collection of scripts (layout: `project`). Generated 2026-10-08.
 | ensemble_diploid_analysis | shell | [`ensemble_diploid_analysis/smoove_test/t_out2/test-lumpy-cmd.sh`](./ensemble_diploid_analysis/smoove_test/t_out2/test-lumpy-cmd.sh) |
 | ensemble_diploid_analysis | shell | [`ensemble_diploid_analysis/smoove_test/t_out/test-lumpy-cmd.sh`](./ensemble_diploid_analysis/smoove_test/t_out/test-lumpy-cmd.sh) |
 | ensemble_diploid_analysis | snakemake | [`ensemble_diploid_analysis/Snakefile`](./ensemble_diploid_analysis/Snakefile) |
+| ensemble_sv_analysis | python | [`ensemble_sv_analysis/breakpoint_table.py`](./ensemble_sv_analysis/breakpoint_table.py) |
+| ensemble_sv_analysis | python | [`ensemble_sv_analysis/check_ids.py`](./ensemble_sv_analysis/check_ids.py) |
+| ensemble_sv_analysis | python | [`ensemble_sv_analysis/make_bam_map.py`](./ensemble_sv_analysis/make_bam_map.py) |
+| ensemble_sv_analysis | python | [`ensemble_sv_analysis/rank_svs.py`](./ensemble_sv_analysis/rank_svs.py) |
+| ensemble_sv_analysis | python | [`ensemble_sv_analysis/rank_svs_v2.py`](./ensemble_sv_analysis/rank_svs_v2.py) |
+| ensemble_sv_analysis | python | [`ensemble_sv_analysis/rank_svs_v3.py`](./ensemble_sv_analysis/rank_svs_v3.py) |
 | ensemble_sv_analysis | python | [`ensemble_sv_analysis/scripts/cohort_merge_filter.py`](./ensemble_sv_analysis/scripts/cohort_merge_filter.py) |
 | ensemble_sv_analysis | python | [`ensemble_sv_analysis/scripts/cohort_stats.py`](./ensemble_sv_analysis/scripts/cohort_stats.py) |
+| ensemble_sv_analysis | python | [`ensemble_sv_analysis/scripts/make_colonies.py`](./ensemble_sv_analysis/scripts/make_colonies.py) |
 | ensemble_sv_analysis | python | [`ensemble_sv_analysis/scripts/plot_site_frequency_spectrum.py`](./ensemble_sv_analysis/scripts/plot_site_frequency_spectrum.py) |
+| ensemble_sv_analysis | python | [`ensemble_sv_analysis/scripts/rank_svs.py`](./ensemble_sv_analysis/scripts/rank_svs.py) |
 | ensemble_sv_analysis | python | [`ensemble_sv_analysis/scripts/sv_genotype_counts.py`](./ensemble_sv_analysis/scripts/sv_genotype_counts.py) |
+| ensemble_sv_analysis | shell | [`ensemble_sv_analysis/igv_top20.sh`](./ensemble_sv_analysis/igv_top20.sh) |
+| ensemble_sv_analysis | shell | [`ensemble_sv_analysis/plot_ranked.sh`](./ensemble_sv_analysis/plot_ranked.sh) |
+| ensemble_sv_analysis | shell | [`ensemble_sv_analysis/plot_ranked_v3.sh`](./ensemble_sv_analysis/plot_ranked_v3.sh) |
+| ensemble_sv_analysis | shell | [`ensemble_sv_analysis/scripts/plot_top20.sh`](./ensemble_sv_analysis/scripts/plot_top20.sh) |
+| ensemble_sv_analysis | shell | [`ensemble_sv_analysis/scripts/test_controls.sh`](./ensemble_sv_analysis/scripts/test_controls.sh) |
 | ensemble_sv_analysis | snakemake | [`ensemble_sv_analysis/Snakefile`](./ensemble_sv_analysis/Snakefile) |
 | functional_sv | python | [`functional_sv/annotate_sv.py`](./functional_sv/annotate_sv.py) |
 | haploids_bam | python | [`haploids_bam/scripts/extract_column.py`](./haploids_bam/scripts/extract_column.py) |
